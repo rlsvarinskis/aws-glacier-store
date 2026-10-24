@@ -130,6 +130,7 @@ Run long uploads inside `tmux` or `screen`, so a closed terminal doesn't kill th
 | `glacier-db` | `list [--all]` | Lists uploads; `--all` adds dry runs and failed attempts |
 | | `show NAME` | Everything recorded for one upload, except its key |
 | | `show-key NAME` | Prints the upload's encryption key |
+| | `backup FILE` | Saves a copy of the database, readable only by you; safe during an upload. `--force` replaces FILE |
 | `glacier-cdn-setup` | | One-time setup of the CloudFront download path |
 
 `glacier-put` refuses a name that is already in the archive. `glacier-get` restores into the current directory when
@@ -191,14 +192,27 @@ command run as `ssh host glacier-get …` looks in `~/.local/share/glacier`, fin
 
 ## Backup and disaster recovery
 
-**Back up `$XDG_DATA_HOME/glacier` off the machine after every upload.** `glacier.db` holds the only copies of the keys;
-without it nothing in the bucket can ever be decrypted. Keep the backup encrypted.
+**Back up the database off the machine after every upload.** `glacier.db` holds the only copies of the keys; without
+it nothing in the bucket can ever be decrypted.
+
+```bash
+glacier-db backup ~/glacier-db-$(date +%F).db
+```
+
+`glacier-db backup` uses SQLite's online backup API, so the copy is consistent even while an upload is writing to the
+database. It creates the file readable only by you, refuses to replace an existing file unless given `--force`, and
+prints how many uploads it saved. Where the backup goes is up to you; keep it encrypted (e.g. `gpg --symmetric`) and
+off this machine. To restore the database, copy the backup to `$XDG_DATA_HOME/glacier/glacier.db`.
+
+The backup holds only the database. `cdn.env` and `cloudfront-signing-key.pem` in the same directory never change after
+setup; copy them once as well, so `glacier-get` keeps downloading through CloudFront on a new machine. Without them, the
+direct S3 download below still works.
 
 The format is plain tar inside standard gpg encryption, so a file can be restored by hand with only the database backup
 and the AWS CLI:
 
 ```bash
-# 1. The file's key
+# 1. The file's key, from glacier.db or a backup of it
 sqlite3 glacier.db "SELECT passphrase FROM uploads WHERE s3_key='disk-images/laptop.img.xz' AND status='uploaded' ORDER BY started_at DESC LIMIT 1" > key.txt
 # 2. If it is in Glacier or Deep Archive: restore it, then wait until head-object shows ongoing-request="false"
 aws s3api restore-object --region REGION --bucket BUCKET --key disk-images/laptop.img.xz \

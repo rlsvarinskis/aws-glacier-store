@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """glacier-db: the local database of glacier-put uploads ($XDG_DATA_HOME/glacier/glacier.db).
 
-Each upload has its own random encryption key. The database holds the only copy of those keys, so back up
-$XDG_DATA_HOME/glacier (default ~/.local/share/glacier) somewhere off this machine.
+Each upload has its own random encryption key. The database holds the only copy of those keys, so after every
+upload make a backup with glacier-db backup and keep it, encrypted, somewhere off this machine.
 
-  glacier-db list [--all]          uploads (--all includes dry runs and failed attempts)
-  glacier-db show NAME             everything recorded for an upload, except its key
-  glacier-db show-key NAME         print the upload's encryption key
+  glacier-db list [--all]           uploads (--all includes dry runs and failed attempts)
+  glacier-db show NAME              everything recorded for an upload, except its key
+  glacier-db show-key NAME          print the upload's encryption key
+  glacier-db backup [--force] FILE  copy the database to FILE, readable only by you; safe while an upload runs.
+                                    Refuses to replace an existing FILE without --force.
 
 NAME is the full name in the archive, including its folder, e.g. disk-images/laptop.img.xz.
 
@@ -21,6 +23,8 @@ import pwd
 import sqlite3
 import sys
 import tarfile
+import tempfile
+import urllib.parse
 from datetime import datetime, timezone
 
 STATE_DIR = os.environ.get("GLACIER_STATE_DIR") or os.path.join(
@@ -224,6 +228,51 @@ def cmd_show(a):
     print(f"{'passphrase':16} (glacier-db show-key {a.s3_key})")
 
 
+def cmd_backup(a):
+    """Snapshot with SQLite's online backup API: consistent even while glacier-put is writing to the database."""
+    os.umask(0o077)
+    dest = os.path.abspath(a.file)
+    if os.path.isdir(dest):
+        sys.exit(f"glacier-db: {a.file} is a directory; give the backup a file name")
+    if os.path.lexists(dest) and not a.force:
+        sys.exit(f"glacier-db: {a.file} already exists (--force replaces it)")
+    if not os.path.isfile(DB_PATH):
+        sys.exit(f"glacier-db: no database at {DB_PATH}")
+    if os.path.exists(dest) and os.path.samefile(dest, DB_PATH):
+        sys.exit(f"glacier-db: {a.file} is the database itself")
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".glacier-db-backup.", dir=os.path.dirname(dest))  # mode 0600
+    except OSError as e:
+        sys.exit(f"glacier-db: can't write to {os.path.dirname(dest)}: {e.strerror}")
+    os.close(fd)
+    try:
+        src = sqlite3.connect(f"file:{urllib.parse.quote(DB_PATH)}?mode=rw", uri=True, timeout=60)  # never creates
+        dst = sqlite3.connect(tmp)
+        src.backup(dst)  # all pages in one step under a read lock; a writer waits a moment
+        src.close()
+        check = dst.execute("PRAGMA integrity_check").fetchone()[0]
+        statuses = [r[0] for r in dst.execute("SELECT status FROM uploads")]
+        dst.close()
+        if check != "ok":
+            sys.exit(f"glacier-db: the backup failed its integrity check: {check}")
+        if a.force:
+            os.replace(tmp, dest)
+        else:
+            try:
+                os.link(tmp, dest)  # unlike rename, never replaces a file that appeared meanwhile
+            except FileExistsError:
+                sys.exit(f"glacier-db: {a.file} already exists (--force replaces it)")
+            except OSError:  # no hard links on this filesystem (e.g. FAT)
+                os.rename(tmp, dest)
+    except sqlite3.Error as e:
+        sys.exit(f"glacier-db: backup failed: {e}")
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    print(f"saved {len(statuses)} upload{'' if len(statuses) == 1 else 's'} ({statuses.count('uploaded')} of them "
+          f"uploaded) to {dest}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--bucket", default=setting("GLACIER_BUCKET"))
@@ -243,12 +292,16 @@ def main():
     for name in ("resolve", "lookup", "passphrase", "show", "show-key"):
         sub.add_parser(name).add_argument("s3_key")
     sub.add_parser("list").add_argument("--all", action="store_true")
+    s = sub.add_parser("backup")
+    s.add_argument("file")
+    s.add_argument("--force", action="store_true")
 
     a = p.parse_args()
-    if not a.bucket:
+    if not a.bucket and a.cmd != "backup":
         sys.exit("glacier-db: set GLACIER_BUCKET in the environment or in $XDG_CONFIG_HOME/glacier/config")
     {"resolve": cmd_resolve, "begin": cmd_begin, "finish": cmd_finish, "hash-tar": cmd_hash_tar, "lookup": cmd_lookup,
-     "passphrase": cmd_passphrase, "show-key": cmd_passphrase, "list": cmd_list, "show": cmd_show}[a.cmd](a)
+     "passphrase": cmd_passphrase, "show-key": cmd_passphrase, "list": cmd_list, "show": cmd_show,
+     "backup": cmd_backup}[a.cmd](a)
 
 
 if __name__ == "__main__":
