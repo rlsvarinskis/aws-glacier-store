@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudFrontSetup",
+      "Effect": "Allow",
+      "Action": [
+        "cloudfront:CreatePublicKey",
+        "cloudfront:CreateKeyGroup",
+        "cloudfront:CreateOriginAccessControl",
+        "cloudfront:CreateDistribution",
+        "cloudfront:GetDistribution",
+        "cloudfront:ListDistributions"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "BucketPolicySetup",
+      "Effect": "Allow",
+      "Action": ["s3:GetBucketPolicy", "s3:PutBucketPolicy"],
+      "Resource": "arn:aws:s3:::BUCKET"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+# Copy to $XDG_CONFIG_HOME/glacier/config (default ~/.config/glacier/config).
+# Environment variables of the same name override these values.
+GLACIER_BUCKET=my-archive-bucket
+GLACIER_REGION=eu-north-1

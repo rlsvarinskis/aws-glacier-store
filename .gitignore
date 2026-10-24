@@ -1,0 +1,7 @@
+# Never commit the tools' state: it holds the only copies of the encryption keys.
+glacier.db
+*.db
+*.pem
+cdn.env
+/config
+__pycache__/

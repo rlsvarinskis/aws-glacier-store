@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+#
+# glacier-cdn-setup: one-time setup of a private CloudFront download path for the Glacier bucket.
+#
+# Downloads through CloudFront are free up to 1 TB/month on the pay-as-you-go always-free tier, and S3 -> CloudFront
+# transfer is free, so restores avoid S3 internet egress fees.
+#
+# Creates:
+#   - an RSA signing key pair (private key stays in $STATE_DIR, never leaves this machine)
+#   - a CloudFront public key + key group (viewers need a URL signed with that private key)
+#   - an Origin Access Control, so CloudFront reads the bucket while the bucket stays private
+#   - a distribution: HTTPS only, GET/HEAD only, caching disabled (needed for objects > 50 GB), signed URLs required
+#   - a bucket policy that lets only this distribution call s3:GetObject
+#
+# Needs AWS credentials that may manage CloudFront and the bucket policy, e.g. AWS_PROFILE=admin glacier-cdn-setup.
+
+set -euo pipefail
+
+CACHING_DISABLED=4135ea2d-6df8-44a3-9df3-4b5a84be39ad   # AWS managed cache policy "CachingDisabled"
+
+die() { echo "glacier-cdn-setup: $*" >&2; exit 1; }
+
+# Settings: GLACIER_BUCKET and GLACIER_REGION come from the environment or from
+# $XDG_CONFIG_HOME/glacier/config (default ~/.config/glacier/config), one KEY=value per line.
+# Keys and other state live in $XDG_DATA_HOME/glacier (default ~/.local/share/glacier).
+CONFIG=${GLACIER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/glacier/config}
+ENV_BUCKET=${GLACIER_BUCKET:-} ENV_REGION=${GLACIER_REGION:-}
+# shellcheck source=/dev/null
+if [[ -r $CONFIG ]]; then source "$CONFIG"; fi
+BUCKET=${ENV_BUCKET:-${GLACIER_BUCKET:-}} REGION=${ENV_REGION:-${GLACIER_REGION:-}}
+[[ -n $BUCKET && -n $REGION ]] || die "set GLACIER_BUCKET and GLACIER_REGION in $CONFIG"
+STATE_DIR=${GLACIER_STATE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/glacier}
+export GLACIER_BUCKET=$BUCKET GLACIER_REGION=$REGION GLACIER_STATE_DIR=$STATE_DIR
+CDN_ENV="$STATE_DIR/cdn.env"
+
+[[ ! -e $CDN_ENV ]] || die "$CDN_ENV exists; setup already done"
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+REF="glacier-$(date +%s)"
+[[ $(aws s3api get-bucket-policy --bucket "$BUCKET" --region "$REGION" 2>&1) == *NoSuchBucketPolicy* ]] \
+    || die "bucket already has a policy; merge the statement by hand instead"
+
+KEY="$STATE_DIR/cloudfront-signing-key.pem"
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$KEY" 2>/dev/null )
+PUB=$(openssl pkey -in "$KEY" -pubout)
+
+# Build request JSON with python3 from exported variables (no jq on this machine).
+js() { python3 -c 'import json, os, sys; e = os.environ; print(json.dumps(eval(sys.argv[1])))' "$1"; }
+export BUCKET REGION REF CACHING_DISABLED PUB ACCOUNT
+
+PUBKEY_ID=$(aws cloudfront create-public-key --query PublicKey.Id --output text --public-key-config "$(js \
+    '{"CallerReference": e["REF"], "Name": "glacier-download", "EncodedKey": e["PUB"],
+      "Comment": "signs Glacier download URLs"}')")
+echo "public key:  $PUBKEY_ID"
+export PUBKEY_ID
+
+KEYGROUP_ID=$(aws cloudfront create-key-group --query KeyGroup.Id --output text --key-group-config "$(js \
+    '{"Name": "glacier-download", "Items": [e["PUBKEY_ID"]], "Comment": "Glacier download signers"}')")
+echo "key group:   $KEYGROUP_ID"
+export KEYGROUP_ID
+
+OAC_ID=$(aws cloudfront create-origin-access-control --query OriginAccessControl.Id --output text \
+    --origin-access-control-config "$(js '{"Name": "oac-" + e["BUCKET"], "Description": "Glacier bucket",
+        "SigningProtocol": "sigv4", "SigningBehavior": "always", "OriginAccessControlOriginType": "s3"}')")
+echo "OAC:         $OAC_ID"
+export OAC_ID
+
+read -r DIST_ID DIST_DOMAIN < <(aws cloudfront create-distribution --output text \
+    --query 'Distribution.[Id,DomainName]' --distribution-config "$(js '{
+    "CallerReference": e["REF"],
+    "Comment": "Glacier bucket downloads (signed URLs only)",
+    "Enabled": True,
+    "PriceClass": "PriceClass_100",
+    "HttpVersion": "http2and3",
+    "IsIPV6Enabled": True,
+    "Origins": {"Quantity": 1, "Items": [{
+        "Id": "glacier-bucket",
+        "DomainName": e["BUCKET"] + ".s3." + e["REGION"] + ".amazonaws.com",
+        "OriginAccessControlId": e["OAC_ID"],
+        "S3OriginConfig": {"OriginAccessIdentity": ""},
+        "ConnectionAttempts": 3, "ConnectionTimeout": 10}]},
+    "DefaultCacheBehavior": {
+        "TargetOriginId": "glacier-bucket",
+        "ViewerProtocolPolicy": "https-only",
+        "AllowedMethods": {"Quantity": 2, "Items": ["GET", "HEAD"],
+                           "CachedMethods": {"Quantity": 2, "Items": ["GET", "HEAD"]}},
+        "CachePolicyId": e["CACHING_DISABLED"],
+        "Compress": False,
+        "TrustedKeyGroups": {"Enabled": True, "Quantity": 1, "Items": [e["KEYGROUP_ID"]]}},
+    "ViewerCertificate": {"CloudFrontDefaultCertificate": True}}')")
+echo "distribution: $DIST_ID ($DIST_DOMAIN)"
+export DIST_ID
+
+aws s3api put-bucket-policy --bucket "$BUCKET" --region "$REGION" --policy "$(js '{
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Sid": "CloudFrontGlacierDownloads",
+        "Effect": "Allow",
+        "Principal": {"Service": "cloudfront.amazonaws.com"},
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::" + e["BUCKET"] + "/*",
+        "Condition": {"StringEquals": {
+            "AWS:SourceArn": "arn:aws:cloudfront::" + e["ACCOUNT"] + ":distribution/" + e["DIST_ID"]}}}]}')"
+echo "bucket policy set"
+
+cat > "$CDN_ENV" <<EOF
+CDN_DOMAIN=$DIST_DOMAIN
+CDN_DISTRIBUTION_ID=$DIST_ID
+CDN_KEY_PAIR_ID=$PUBKEY_ID
+CDN_KEY_GROUP_ID=$KEYGROUP_ID
+CDN_OAC_ID=$OAC_ID
+EOF
+chmod 600 "$CDN_ENV"
+echo "saved $CDN_ENV; the distribution takes a few minutes to deploy"

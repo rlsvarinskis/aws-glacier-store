@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""glacier-db: the local database of glacier-put uploads ($XDG_DATA_HOME/glacier/glacier.db).
+
+Each upload has its own random encryption key. The database holds the only copy of those keys, so back up
+$XDG_DATA_HOME/glacier (default ~/.local/share/glacier) somewhere off this machine.
+
+  glacier-db list [--all]          uploads (--all includes dry runs and failed attempts)
+  glacier-db show NAME             everything recorded for an upload, except its key
+  glacier-db show-key NAME         print the upload's encryption key
+
+NAME is the full name in the archive, including its folder, e.g. disk-images/laptop.img.xz.
+
+Used internally by glacier-put / glacier-get:
+  begin, finish, hash-tar, resolve, lookup, passphrase
+"""
+import argparse
+import grp
+import hashlib
+import os
+import pwd
+import sqlite3
+import sys
+import tarfile
+from datetime import datetime, timezone
+
+STATE_DIR = os.environ.get("GLACIER_STATE_DIR") or os.path.join(
+    os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "glacier")
+DB_PATH = os.path.join(STATE_DIR, "glacier.db")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS uploads (
+    id              TEXT PRIMARY KEY,
+    bucket          TEXT NOT NULL,
+    s3_key          TEXT NOT NULL,
+    storage_class   TEXT NOT NULL,
+    status          TEXT NOT NULL,          -- uploading | uploaded | failed | dry-run
+    source_path     TEXT NOT NULL,
+    source_size     INTEGER NOT NULL,
+    source_mtime_ns INTEGER NOT NULL,
+    source_mode     TEXT NOT NULL,
+    source_owner    TEXT NOT NULL,
+    source_sha512   TEXT,                   -- of the original file's contents
+    tar_sha256      TEXT,                   -- of the tar stream (before encryption)
+    object_sha256   TEXT,                   -- of the encrypted object as stored in S3
+    object_size     INTEGER,
+    format          TEXT NOT NULL,
+    passphrase      TEXT NOT NULL,
+    started_at      TEXT NOT NULL,
+    finished_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS uploads_key ON uploads (bucket, s3_key);
+"""
+
+
+def setting(name):
+    """GLACIER_* setting from the environment, else from $XDG_CONFIG_HOME/glacier/config (KEY=value lines)."""
+    if os.environ.get(name):
+        return os.environ[name]
+    config = os.environ.get("GLACIER_CONFIG") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "glacier", "config")
+    try:
+        with open(config) as f:
+            for line in f:
+                key, sep, value = line.strip().partition("=")
+                if sep and key.strip() == name:
+                    return value.strip().strip("'\"")
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def now():
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def db():
+    new = not os.path.exists(DB_PATH)
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    old_umask = os.umask(0o077)
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=60)
+    finally:
+        os.umask(old_umask)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    if new:
+        print(f"*** Created {DB_PATH}. It holds the only copies of the per-file encryption keys:\n"
+              f"*** back up {STATE_DIR} somewhere off this machine.", file=sys.stderr)
+    return conn
+
+
+def read_fd(fd):
+    with os.fdopen(int(fd), "r", closefd=False) as f:
+        value = f.readline().strip()
+    if len(value) < 20:
+        sys.exit("glacier-db: passphrase too short")
+    return value
+
+
+def latest(conn, bucket, key, statuses=("uploaded",)):
+    q = f"SELECT * FROM uploads WHERE bucket=? AND s3_key=? AND status IN ({','.join('?' * len(statuses))}) " \
+        "ORDER BY started_at DESC LIMIT 1"
+    return conn.execute(q, (bucket, key, *statuses)).fetchone()
+
+
+def resolve(conn, bucket, name, statuses=("uploaded",)):
+    """Names are exact: an upload to disk-images/ is always called disk-images/<file>."""
+    marks = ",".join("?" * len(statuses))
+    if conn.execute(f"SELECT 1 FROM uploads WHERE bucket=? AND status IN ({marks}) AND s3_key=?",
+                    (bucket, *statuses, name)).fetchone():
+        return name
+    keys = [r[0] for r in conn.execute(
+        f"SELECT DISTINCT s3_key FROM uploads WHERE bucket=? AND status IN ({marks})", (bucket, *statuses))]
+    near = [k for k in keys if os.path.basename(k) == os.path.basename(name)]
+    hint = ("\ndid you mean:\n  " + "\n  ".join(sorted(near))) if near else " (see glacier-db list)"
+    sys.exit(f"glacier-db: nothing named '{name}' in the archive{hint}")
+
+
+def cmd_resolve(a):
+    with db() as conn:
+        print(resolve(conn, a.bucket, a.s3_key))
+
+
+def cmd_begin(a):
+    st = os.stat(a.source)
+    try:
+        owner = f"{pwd.getpwuid(st.st_uid).pw_name}:{grp.getgrgid(st.st_gid).gr_name}"
+    except KeyError:
+        owner = f"{st.st_uid}:{st.st_gid}"
+    with db() as conn:
+        if latest(conn, a.bucket, a.s3_key) and not a.dry_run:
+            sys.exit(f"glacier-db: s3://{a.bucket}/{a.s3_key} is already recorded as uploaded")
+        conn.execute(
+            "INSERT INTO uploads (id, bucket, s3_key, storage_class, status, source_path, source_size, "
+            "source_mtime_ns, source_mode, source_owner, format, passphrase, started_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (a.id, a.bucket, a.s3_key, a.storage_class, "dry-run" if a.dry_run else "uploading",
+             os.path.realpath(a.source), st.st_size, st.st_mtime_ns, oct(st.st_mode & 0o7777), owner,
+             "tar-posix+gpg-symmetric-aes256", read_fd(a.passphrase_fd), now()))
+
+
+def cmd_finish(a):
+    with db() as conn:
+        row = conn.execute("SELECT status FROM uploads WHERE id=?", (a.id,)).fetchone()
+        if row is None:
+            sys.exit(f"glacier-db: unknown upload id {a.id}")
+        status = "dry-run" if row["status"] == "dry-run" else a.status
+        conn.execute(
+            "UPDATE uploads SET status=?, source_sha512=COALESCE(?, source_sha512), "
+            "tar_sha256=COALESCE(?, tar_sha256), object_sha256=COALESCE(?, object_sha256), "
+            "object_size=COALESCE(?, object_size), finished_at=? WHERE id=?",
+            (status, a.source_sha512, a.tar_sha256, a.object_sha256, a.object_size, now(), a.id))
+
+
+def cmd_hash_tar(a):
+    """Read a tar stream on stdin; print the SHA-512 of the (single) regular file in it. Always drains stdin."""
+    stdin = sys.stdin.buffer
+    digest = None
+    with tarfile.open(fileobj=stdin, mode="r|") as tf:
+        for member in tf:
+            if member.isfile():
+                if digest is not None:
+                    sys.exit("glacier-db: more than one file in the tar stream")
+                h = hashlib.sha512()
+                f = tf.extractfile(member)
+                while chunk := f.read(4 << 20):
+                    h.update(chunk)
+                digest = h.hexdigest()
+    while stdin.read(4 << 20):
+        pass
+    if digest is None:
+        sys.exit("glacier-db: no regular file in the tar stream")
+    print(digest)
+
+
+def cmd_lookup(a):
+    """Tab-separated id, object_sha256, object_size, source_sha512, source_name for glacier-get."""
+    with db() as conn:
+        row = latest(conn, a.bucket, resolve(conn, a.bucket, a.s3_key))
+    if row is None:
+        sys.exit(1)
+    print("\t".join(str(x) for x in (row["id"], row["object_sha256"], row["object_size"], row["source_sha512"],
+                                       os.path.basename(row["source_path"]))))
+
+
+def cmd_passphrase(a):
+    statuses = ("uploaded",) if a.cmd == "passphrase" else ("uploaded", "uploading", "failed", "dry-run")
+    with db() as conn:
+        row = latest(conn, a.bucket, resolve(conn, a.bucket, a.s3_key, statuses), statuses)
+    if row is None:
+        sys.exit(f"glacier-db: no upload recorded for s3://{a.bucket}/{a.s3_key}")
+    print(row["passphrase"])
+
+
+def cmd_list(a):
+    statuses = ("uploaded", "uploading", "failed", "dry-run") if a.all else ("uploaded",)
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM uploads WHERE status IN ({','.join('?' * len(statuses))}) ORDER BY started_at",
+            statuses).fetchall()
+    if not rows:
+        print("no uploads recorded")
+        return
+    print(f"{'uploaded':25} {'class':12} {'size':>10}  {'status':9} {'sha512':18} name")
+    for r in rows:
+        size = f"{r['source_size'] / 2**30:.2f} GiB" if r["source_size"] >= 2**30 else f"{r['source_size'] / 2**20:.1f} MiB"
+        print(f"{(r['finished_at'] or r['started_at']):25} {r['storage_class']:12} {size:>10}  {r['status']:9} "
+              f"{(r['source_sha512'] or '-')[:16]:18} {r['s3_key']}")
+
+
+def cmd_show(a):
+    every = ("uploaded", "uploading", "failed", "dry-run")
+    with db() as conn:
+        row = latest(conn, a.bucket, resolve(conn, a.bucket, a.s3_key, every), every)
+    if row is None:
+        sys.exit(f"glacier-db: no upload recorded for s3://{a.bucket}/{a.s3_key}")
+    for k in row.keys():
+        if k == "passphrase":
+            continue
+        v = row[k]
+        if k == "source_mtime_ns":
+            v = f"{v} ({datetime.fromtimestamp(v / 1e9).astimezone().isoformat()})"
+        print(f"{k:16} {v}")
+    print(f"{'passphrase':16} (glacier-db show-key {a.s3_key})")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--bucket", default=setting("GLACIER_BUCKET"))
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("begin")
+    for opt in ("--id", "--s3-key", "--storage-class", "--source", "--passphrase-fd"):
+        s.add_argument(opt, required=True)
+    s.add_argument("--dry-run", action="store_true")
+    s = sub.add_parser("finish")
+    s.add_argument("--id", required=True)
+    s.add_argument("--status", required=True, choices=["uploaded", "failed"])
+    for opt in ("--source-sha512", "--tar-sha256", "--object-sha256"):
+        s.add_argument(opt)
+    s.add_argument("--object-size", type=int)
+    sub.add_parser("hash-tar")
+    for name in ("resolve", "lookup", "passphrase", "show", "show-key"):
+        sub.add_parser(name).add_argument("s3_key")
+    sub.add_parser("list").add_argument("--all", action="store_true")
+
+    a = p.parse_args()
+    if not a.bucket:
+        sys.exit("glacier-db: set GLACIER_BUCKET in the environment or in $XDG_CONFIG_HOME/glacier/config")
+    {"resolve": cmd_resolve, "begin": cmd_begin, "finish": cmd_finish, "hash-tar": cmd_hash_tar, "lookup": cmd_lookup,
+     "passphrase": cmd_passphrase, "show-key": cmd_passphrase, "list": cmd_list, "show": cmd_show}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+#
+# glacier-get [options] NAME [DEST_DIR]
+#
+# Restores a file stored with glacier-put into DEST_DIR (default: the current directory), with its original
+# permissions, timestamps and extended attributes, and checks it against the SHA-512 recorded at upload.
+#   glacier-get disk-images/laptop.img.xz                  -> ./laptop.img.xz
+#   glacier-get disk-images/laptop.img.xz /mnt/restore     -> /mnt/restore/laptop.img.xz
+# NAME is always the full name it was archived under, including its folder (see glacier-db list).
+#
+# Files in Deep Archive / Glacier first need a restore inside AWS. The first run asks before starting one (it costs
+# a retrieval fee; Deep Archive Bulk takes up to 48 h) and exits; run the same command again once it is ready.
+# Downloads go through the private CloudFront distribution (free up to 1 TB/month) and resume if interrupted.
+#
+# Options:
+#   --stream                 restore while downloading: no room needed for a second copy, but no resume
+#   --tier Bulk|Standard     speed of the restore inside AWS (default Bulk)
+#   --days N                 how long AWS keeps the restored copy readable (default 3)
+#   --passphrase-file FILE   for objects that are not in the database (NAME is then the exact S3 key)
+#
+# Run as root (sudo -E) to restore the original file owner.
+
+set -euo pipefail
+
+GDB=$(dirname -- "$(realpath -- "$0")")/glacier-db
+
+die() { echo "glacier-get: $*" >&2; exit 1; }
+usage() { sed -n '3,/^$/s/^# \{0,1\}//p' "$0" >&2; exit 1; }
+
+STREAM=0 TIER=Bulk DAYS=3 PASSFILE= ARGS=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --stream) STREAM=1 ;;
+        --tier) TIER=${2:?}; shift ;;
+        --days) DAYS=${2:?}; shift ;;
+        --passphrase-file) PASSFILE=${2:?}; shift ;;
+        -h|--help) usage ;;
+        --) shift; ARGS+=("$@"); break ;;
+        -*) die "unknown option $1" ;;
+        *) ARGS+=("$1") ;;
+    esac
+    shift
+done
+[[ ${#ARGS[@]} -eq 1 || ${#ARGS[@]} -eq 2 ]] || usage
+
+# Settings: GLACIER_BUCKET and GLACIER_REGION come from the environment or from
+# $XDG_CONFIG_HOME/glacier/config (default ~/.config/glacier/config), one KEY=value per line.
+# Keys and other state live in $XDG_DATA_HOME/glacier (default ~/.local/share/glacier).
+CONFIG=${GLACIER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/glacier/config}
+ENV_BUCKET=${GLACIER_BUCKET:-} ENV_REGION=${GLACIER_REGION:-}
+# shellcheck source=/dev/null
+if [[ -r $CONFIG ]]; then source "$CONFIG"; fi
+BUCKET=${ENV_BUCKET:-${GLACIER_BUCKET:-}} REGION=${ENV_REGION:-${GLACIER_REGION:-}}
+[[ -n $BUCKET && -n $REGION ]] || die "set GLACIER_BUCKET and GLACIER_REGION in $CONFIG"
+STATE_DIR=${GLACIER_STATE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/glacier}
+export GLACIER_BUCKET=$BUCKET GLACIER_REGION=$REGION GLACIER_STATE_DIR=$STATE_DIR
+export AWS_DEFAULT_REGION=$REGION
+
+DEST=${ARGS[1]:-.}
+[[ $TIER == Bulk || $TIER == Standard ]] || die "--tier must be Bulk or Standard"
+[[ -r $STATE_DIR/cdn.env ]] || die "run glacier-cdn-setup first"
+# shellcheck source=/dev/null
+source "$STATE_DIR/cdn.env"
+
+OBJ_SHA= SRC_SHA=
+if [[ -n $PASSFILE ]]; then
+    KEY=${ARGS[0]}
+else
+    KEY=$("$GDB" resolve "${ARGS[0]}") || exit 1
+    IFS=$'\t' read -r _ OBJ_SHA _ SRC_SHA _ < <("$GDB" lookup "$KEY")
+fi
+NAME=$(basename -- "$KEY")
+FINAL=$DEST/$NAME
+[[ ! -e $FINAL ]] || die "$FINAL already exists"
+
+decrypt() {
+    if [[ -n $PASSFILE ]]; then
+        gpg --batch --quiet --no-symkey-cache --pinentry-mode loopback --passphrase-file "$PASSFILE" --decrypt "$@"
+    else
+        gpg --batch --quiet --no-symkey-cache --pinentry-mode loopback --passphrase-fd 3 --decrypt "$@" \
+            3< <("$GDB" passphrase "$KEY")
+    fi
+}
+sign() {
+    aws cloudfront sign --url "https://$CDN_DOMAIN/$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$1")" \
+        --key-pair-id "$CDN_KEY_PAIR_ID" --private-key "file://$STATE_DIR/cloudfront-signing-key.pem" \
+        --date-less-than "$(date -u -d '+1 day' +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+IFS=$'\t' read -r CLASS SIZE RESTORE < <(aws s3api head-object --bucket "$BUCKET" --key "$KEY" \
+    --query '[StorageClass, ContentLength, Restore]' --output text)
+[[ $CLASS != None ]] || CLASS=STANDARD
+
+if [[ $CLASS == GLACIER || $CLASS == DEEP_ARCHIVE ]]; then
+    if [[ $RESTORE == *'ongoing-request="true"'* ]]; then
+        die "AWS is still restoring $KEY from $CLASS; try again later"
+    elif [[ $RESTORE != *'ongoing-request="false"'* ]]; then
+        GIB=$(( (SIZE + 1073741823) / 1073741824 ))
+        echo "$KEY is in $CLASS ($GIB GiB). AWS has to restore it first ($TIER tier), and keeps the copy for $DAYS days."
+        echo "That costs a retrieval fee plus Standard storage for the copy (see S3 pricing for $REGION)."
+        read -rp "Start the restore now? [y/N] " ok
+        [[ $ok == y || $ok == Y ]] || exit 1
+        aws s3api restore-object --bucket "$BUCKET" --key "$KEY" \
+            --restore-request "{\"Days\":$DAYS,\"GlacierJobParameters\":{\"Tier\":\"$TIER\"}}"
+        echo "Restore requested. Run the same command again when it has finished."
+        exit 0
+    fi
+fi
+
+mkdir -p "$DEST"
+WORK=$(mktemp -d -p "$DEST" .glacier-restore.XXXXXX)   # same filesystem, so the final move is a rename
+trap 'rm -rf -- "$WORK"' EXIT
+mkdir "$WORK/out"
+PART=$DEST/.$NAME.glacier-partial                       # encrypted download; kept between runs so it can resume
+
+echo "downloading $KEY ($(( SIZE / 1048576 )) MiB)"
+if (( STREAM )); then
+    curl -fL --retry 10 --retry-all-errors "$(sign "$KEY")" \
+        | tee >(sha256sum | cut -d' ' -f1 > "$WORK/object.sha256") \
+        | decrypt \
+        | tar -xpf - --xattrs --acls -C "$WORK/out"
+    for _ in $(seq 30); do [[ -s $WORK/object.sha256 ]] && break; sleep 1; done
+    GOT=$(cat "$WORK/object.sha256")
+    [[ -z $OBJ_SHA || $GOT == "$OBJ_SHA" ]] || die "download corrupted (SHA-256 $GOT, expected $OBJ_SHA)"
+else
+    for attempt in $(seq 50); do
+        have=$(stat -c %s "$PART" 2>/dev/null || echo 0)
+        (( have < SIZE )) || break
+        curl -fL -C - --retry 10 --retry-all-errors -o "$PART" "$(sign "$KEY")" && break
+        echo "download interrupted (attempt $attempt), resuming in 30 s" >&2
+        sleep 30
+    done
+    [[ $(stat -c %s "$PART") == "$SIZE" ]] || die "download incomplete; run again to resume"
+    GOT=$(sha256sum "$PART" | cut -d' ' -f1)
+    if [[ -n $OBJ_SHA && $GOT != "$OBJ_SHA" ]]; then
+        rm -f -- "$PART"
+        die "download corrupted (SHA-256 $GOT, expected $OBJ_SHA); deleted it, run again"
+    fi
+    decrypt "$PART" | tar -xpf - --xattrs --acls -C "$WORK/out"
+fi
+
+FILES=("$WORK/out"/*)
+[[ ${#FILES[@]} -eq 1 && -f ${FILES[0]} ]] || die "unexpected archive contents in $WORK"
+if [[ -n $SRC_SHA ]]; then
+    RESTORED_SHA=$(sha512sum "${FILES[0]}" | cut -d' ' -f1)
+    if [[ $RESTORED_SHA != "$SRC_SHA" ]]; then
+        mv -- "${FILES[0]}" "$FINAL.sha512-mismatch"
+        die "restored file does not match the original SHA-512; kept as $FINAL.sha512-mismatch"
+    fi
+fi
+mv -n -- "${FILES[0]}" "$FINAL"
+rm -f -- "$PART"
+if [[ -n $SRC_SHA ]]; then
+    echo "restored $FINAL (SHA-512 matches the original)"
+else
+    echo "restored $FINAL (no recorded SHA-512 to compare against)"
+fi

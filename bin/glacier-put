@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# glacier-put [options] FILE [NAME]
+#
+# Encrypts FILE and stores it in the Glacier bucket. NAME is what it is called in the archive:
+#   glacier-put ~/backups/laptop.img.xz                         -> laptop.img.xz
+#   glacier-put ~/backups/laptop.img.xz disk-images/            -> disk-images/laptop.img.xz
+#   glacier-put ~/backups/laptop.img.xz disk-images/old-pc.xz   -> disk-images/old-pc.xz
+# Get it back with: glacier-get NAME
+#
+# Every file gets its own random encryption key. Keys, the original SHA-512, size, owner, permissions and timestamps
+# are recorded in $XDG_DATA_HOME/glacier/glacier.db (see glacier-db). That database holds the only copies of the
+# keys: back up $XDG_DATA_HOME/glacier off this machine.
+#
+# Options:
+#   --class CLASS       DEEP_ARCHIVE (default), GLACIER, GLACIER_IR, STANDARD_IA or STANDARD
+#   --bandwidth RATE    cap the upload, e.g. 20MB/s (default: unlimited)
+#   --dry-run           do everything except the upload (recorded as a dry run)
+#
+# (Internally: tar --format=posix | gpg --symmetric AES-256 | aws s3 cp, streamed without temporary copies.)
+
+set -euo pipefail
+
+GDB=$(dirname -- "$(realpath -- "$0")")/glacier-db
+
+die() { echo "glacier-put: $*" >&2; exit 1; }
+usage() { sed -n '3,/^$/s/^# \{0,1\}//p' "$0" >&2; exit 1; }
+
+CLASS=DEEP_ARCHIVE BANDWIDTH= DRY_RUN=0 ARGS=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --class) CLASS=${2:?}; shift ;;
+        --bandwidth) BANDWIDTH=${2:?}; shift ;;
+        --dry-run) DRY_RUN=1 ;;
+        -h|--help) usage ;;
+        --) shift; ARGS+=("$@"); break ;;
+        -*) die "unknown option $1" ;;
+        *) ARGS+=("$1") ;;
+    esac
+    shift
+done
+[[ ${#ARGS[@]} -eq 1 || ${#ARGS[@]} -eq 2 ]] || usage
+
+# Settings: GLACIER_BUCKET and GLACIER_REGION come from the environment or from
+# $XDG_CONFIG_HOME/glacier/config (default ~/.config/glacier/config), one KEY=value per line.
+# Keys and other state live in $XDG_DATA_HOME/glacier (default ~/.local/share/glacier).
+CONFIG=${GLACIER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/glacier/config}
+ENV_BUCKET=${GLACIER_BUCKET:-} ENV_REGION=${GLACIER_REGION:-}
+# shellcheck source=/dev/null
+if [[ -r $CONFIG ]]; then source "$CONFIG"; fi
+BUCKET=${ENV_BUCKET:-${GLACIER_BUCKET:-}} REGION=${ENV_REGION:-${GLACIER_REGION:-}}
+[[ -n $BUCKET && -n $REGION ]] || die "set GLACIER_BUCKET and GLACIER_REGION in $CONFIG"
+STATE_DIR=${GLACIER_STATE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/glacier}
+export GLACIER_BUCKET=$BUCKET GLACIER_REGION=$REGION GLACIER_STATE_DIR=$STATE_DIR
+
+SRC=$(realpath -e -- "${ARGS[0]}")
+[[ -f $SRC ]] || die "$SRC is not a regular file"
+NAME=${ARGS[1]:-}
+if [[ -z $NAME ]]; then
+    KEY=$(basename -- "$SRC")
+elif [[ $NAME == */ ]]; then
+    KEY=$NAME$(basename -- "$SRC")
+else
+    KEY=$NAME
+fi
+KEY=${KEY#/}
+case $CLASS in DEEP_ARCHIVE|GLACIER|GLACIER_IR|STANDARD_IA|STANDARD) ;; *) die "unsupported class $CLASS" ;; esac
+for c in aws gpg pv tar openssl python3; do command -v $c >/dev/null || die "missing $c"; done
+
+SIZE=$(stat -c %s -- "$SRC")
+# tar + gpg add well under 0.1%; the margin only has to keep the part count under 10,000.
+EXPECTED=$(( SIZE + SIZE / 100 + 64 * 1024 * 1024 ))
+
+WORK=$(mktemp -d)
+AWS_CFG=$WORK/aws-config
+# Temporary AWS config: region, retries and optional bandwidth cap, without touching ~/.aws/config.
+{
+    echo "[default]"
+    echo "region = $REGION"
+    echo "retry_mode = adaptive"
+    echo "max_attempts = 20"
+    if [[ -n $BANDWIDTH ]]; then
+        echo "s3 ="
+        echo "  max_bandwidth = $BANDWIDTH"
+    fi
+} > "$AWS_CFG"
+export AWS_CONFIG_FILE=$AWS_CFG
+
+if (( ! DRY_RUN )) && aws s3api head-object --bucket "$BUCKET" --key "$KEY" >/dev/null 2>&1; then
+    die "$KEY is already in the archive; refusing to overwrite"
+fi
+
+ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+PASS=$(openssl rand -base64 32)
+DRY_FLAG=()
+(( DRY_RUN )) && DRY_FLAG=(--dry-run)
+# The key goes into the database before any data leaves, so a finished upload can never lack its key.
+"$GDB" begin --id "$ID" --s3-key "$KEY" --storage-class "$CLASS" --source "$SRC" "${DRY_FLAG[@]}" \
+    --passphrase-fd 3 3<<<"$PASS"
+FINISHED=0
+cleanup() {
+    (( FINISHED )) || "$GDB" finish --id "$ID" --status failed || true
+    rm -rf -- "$WORK"
+}
+trap cleanup EXIT
+
+if (( DRY_RUN )); then
+    upload() { cat > "${GLACIER_DRY_RUN_OUTPUT:-/dev/null}"; }   # env var: keep the encrypted stream (tests)
+    echo "$(date -Is) dry run: $SRC as $KEY ($SIZE bytes), nothing will be uploaded"
+else
+    upload() {
+        aws s3 cp - "s3://$BUCKET/$KEY" --storage-class "$CLASS" --expected-size "$EXPECTED" --no-progress \
+            --metadata "upload-id=$ID,original-name=$(basename -- "$SRC" | tr -c 'A-Za-z0-9._-' _),original-size=$SIZE,format=tar-posix+gpg-symmetric-aes256"
+    }
+    echo "$(date -Is) archiving $SRC as $KEY ($SIZE bytes, $CLASS)"
+fi
+
+tar --format=posix --xattrs --acls -C "$(dirname -- "$SRC")" -cf - -- "$(basename -- "$SRC")" \
+    | tee >("$GDB" hash-tar > "$WORK/source.sha512") >(sha256sum | cut -d' ' -f1 > "$WORK/tar.sha256") \
+    | gpg --batch --quiet --no-symkey-cache --pinentry-mode loopback --passphrase-fd 3 \
+          --symmetric --cipher-algo AES256 --compress-algo none \
+          --s2k-mode 3 --s2k-digest-algo SHA512 --s2k-count 65011712 --output - 3<<<"$PASS" \
+    | tee >(sha256sum | cut -d' ' -f1 > "$WORK/object.sha256") >(wc -c > "$WORK/object.size") \
+    | pv -f -i 30 -s "$SIZE" -N "$(basename -- "$KEY")" \
+    | upload
+unset PASS
+
+for _ in $(seq 120); do
+    [[ -s $WORK/source.sha512 && -s $WORK/tar.sha256 && -s $WORK/object.sha256 && -s $WORK/object.size ]] && break
+    sleep 1
+done
+OBJ_SIZE=$(tr -d ' ' < "$WORK/object.size")
+if (( ! DRY_RUN )); then
+    S3_SIZE=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --query ContentLength --output text)
+    [[ $S3_SIZE == "$OBJ_SIZE" ]] || die "S3 reports $S3_SIZE bytes but $OBJ_SIZE were sent"
+fi
+
+"$GDB" finish --id "$ID" --status uploaded --source-sha512 "$(cat "$WORK/source.sha512")" \
+    --tar-sha256 "$(cat "$WORK/tar.sha256")" --object-sha256 "$(cat "$WORK/object.sha256")" --object-size "$OBJ_SIZE"
+FINISHED=1
+echo "$(date -Is) done: $KEY is in the archive. Get it back with: glacier-get $KEY"
+"$GDB" show "$KEY"
