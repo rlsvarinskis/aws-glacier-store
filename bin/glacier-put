@@ -108,9 +108,11 @@ if (( DRY_RUN )); then
     upload() { cat > "${GLACIER_DRY_RUN_OUTPUT:-/dev/null}"; }   # env var: keep the encrypted stream (tests)
     echo "$(date -Is) dry run: $SRC as $KEY ($SIZE bytes), nothing will be uploaded"
 else
+    ORIG_NAME=$(basename -- "$SRC")
+    ORIG_NAME=${ORIG_NAME//[^A-Za-z0-9._-]/_}   # S3 metadata must be plain ASCII
     upload() {
         aws s3 cp - "s3://$BUCKET/$KEY" --storage-class "$CLASS" --expected-size "$EXPECTED" --no-progress \
-            --metadata "upload-id=$ID,original-name=$(basename -- "$SRC" | tr -c 'A-Za-z0-9._-' _),original-size=$SIZE,format=tar-posix+gpg-symmetric-aes256"
+            --metadata "upload-id=$ID,original-name=$ORIG_NAME,original-size=$SIZE,format=tar-posix+gpg-symmetric-aes256"
     }
     echo "$(date -Is) archiving $SRC as $KEY ($SIZE bytes, $CLASS)"
 fi

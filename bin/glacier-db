@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 STATE_DIR = os.environ.get("GLACIER_STATE_DIR") or os.path.join(
     os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "glacier")
 DB_PATH = os.path.join(STATE_DIR, "glacier.db")
+# "deleted" = the object was removed from S3 after upload; the row stays as a record.
+EVERY_STATUS = ("uploaded", "uploading", "failed", "dry-run", "deleted")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS uploads (
@@ -37,7 +39,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     bucket          TEXT NOT NULL,
     s3_key          TEXT NOT NULL,
     storage_class   TEXT NOT NULL,
-    status          TEXT NOT NULL,          -- uploading | uploaded | failed | dry-run
+    status          TEXT NOT NULL,          -- uploading | uploaded | failed | dry-run | deleted
     source_path     TEXT NOT NULL,
     source_size     INTEGER NOT NULL,
     source_mtime_ns INTEGER NOT NULL,
@@ -188,7 +190,7 @@ def cmd_lookup(a):
 
 
 def cmd_passphrase(a):
-    statuses = ("uploaded",) if a.cmd == "passphrase" else ("uploaded", "uploading", "failed", "dry-run")
+    statuses = ("uploaded",) if a.cmd == "passphrase" else EVERY_STATUS
     with db() as conn:
         row = latest(conn, a.bucket, resolve(conn, a.bucket, a.s3_key, statuses), statuses)
     if row is None:
@@ -197,7 +199,7 @@ def cmd_passphrase(a):
 
 
 def cmd_list(a):
-    statuses = ("uploaded", "uploading", "failed", "dry-run") if a.all else ("uploaded",)
+    statuses = EVERY_STATUS if a.all else ("uploaded",)
     with db() as conn:
         rows = conn.execute(
             f"SELECT * FROM uploads WHERE status IN ({','.join('?' * len(statuses))}) ORDER BY started_at",
@@ -213,9 +215,8 @@ def cmd_list(a):
 
 
 def cmd_show(a):
-    every = ("uploaded", "uploading", "failed", "dry-run")
     with db() as conn:
-        row = latest(conn, a.bucket, resolve(conn, a.bucket, a.s3_key, every), every)
+        row = latest(conn, a.bucket, resolve(conn, a.bucket, a.s3_key, EVERY_STATUS), EVERY_STATUS)
     if row is None:
         sys.exit(f"glacier-db: no upload recorded for s3://{a.bucket}/{a.s3_key}")
     for k in row.keys():
